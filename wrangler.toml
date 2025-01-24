@@ -1,0 +1,40 @@
+
+name = "call-agent"
+main = "src/index.ts"
+compatibility_flags = [ "nodejs_compat" ]
+compatibility_date = "2025-01-24"
+
+[observability]
+enabled = true
+
+
+
+# Durable Objects configuration (currently commented out)
+[[durable_objects.bindings]]
+name = "DO"
+class_name = "CALL_SESSION"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CALL_SESSION"]
+
+
+
+
+
+
+
+
+
+# Note: Use secrets to store sensitive data.
+# https://developers.cloudflare.com/workers/configuration/secrets/
+
+
+# [assets]
+# directory = "./public/"
+# binding = "ASSETS"
+
+
+# [[services]]
+# binding = "MY_SERVICE"
+# service = "my-service"
