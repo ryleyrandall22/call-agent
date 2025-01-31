@@ -16,7 +16,7 @@ class_name = "CALL_SESSION"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["CALL_SESSION"]
+new_classes = ["CALL_SESSION"]
 
 
 

@@ -8,15 +8,15 @@ import type { OpenAI } from 'openai';
 const app = new Hono<{ Bindings: Env }>();
 
 const tools = [
-	zodFunction({
-		name: 'Send_Customer_Email',
-		parameters: z.object({
-			email: z.string().describe('The users email. MAKE SURE YOU DOUBLE CHECK THE SPELLING'),
-			subject: z.string().describe('Subject line of the email'),
-			content: z.string().describe('The plain text content of the email'),
-		}),
-		description: 'Send the user an email with information they request during the call',
-	}),
+	// zodFunction({
+	// 	name: 'Send_Customer_Email',
+	// 	parameters: z.object({
+	// 		email: z.string().describe('The users email. MAKE SURE YOU DOUBLE CHECK THE SPELLING'),
+	// 		subject: z.string().describe('Subject line of the email'),
+	// 		content: z.string().describe('The plain text content of the email'),
+	// 	}),
+	// 	description: 'Send the user an email with information they request during the call',
+	// }),
 	zodFunction({
 		name: 'get_rates',
 		parameters: z.object({}),
@@ -29,10 +29,17 @@ const tools = [
 		}),
 		description: 'Sends a text to the person you are currently talking to',
 	}),
+	zodFunction({
+		name: 'end_call',
+		parameters: z.object({}),
+		description: 'End the current phone call',
+	}),
 ];
 
 // Constants
-const SYSTEM_MESSAGE = `Your name is Jamie. You are an customer advocate who works for ExpressOne Mortgage. DO NOT REVEAL YOU ARE AN AI ASSISTANT UNLESS THE USER SPECIFCIALLY ASKS IF YOU ARE. Answer the users questions about Reverse Mortgages while trying to collect their personal info. Be as human as you can, use filler words like "um" and "Yeah one moment". Be casual but professional`;
+const SYSTEM_MESSAGE = `Your name is Jamie. You are an customer advocate who works for ExpressOne Mortgage. DO NOT REVEAL YOU ARE AN AI ASSISTANT UNLESS THE USER SPECIFCIALLY ASKS IF YOU ARE. Answer the users questions about Reverse Mortgages while trying to collect their personal info. Be as human as you can, use filler words like "um" and "Yeah one moment". Be casual but professional.
+The way you process audio is quite perfect, so if the user says something that seems to weird not fit the conversation, ask the user to clarify before continuing
+`;
 
 const VOICE = 'alloy';
 
@@ -53,16 +60,17 @@ app.get('/', (c) => c.json({ message: 'Twilio Media Stream Server is running!' }
 // Route for Twilio to handle incoming and outgoing calls
 app.all('/incoming-call', async (c) => {
 	const body = await c.req.parseBody();
-	console.log('REQUEST BODY =>', body);
 	// Create URL parameters for the WebSocket connection
-	const url = new URLSearchParams();
+	console.log(`Caller:$${body.Caller}`);
+	const params = new URLSearchParams();
 
-	url.append('Caller', body.Caller as string);
-	console.log('FINAL==>', url.toString());
+	params.append('Caller', body.Caller as string);
 	const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
                             <Response>
                                 <Connect>
-                                    <Stream url="wss://${c.req.header('host')}/media-stream?${url.toString()}" />
+                                    <Stream url="wss://${c.req.header('host')}/${encodeURIComponent(
+		body.Caller as string
+	)}/media-stream?${params.toString()}" />
                                 </Connect>
                             </Response>`;
 
@@ -71,7 +79,7 @@ app.all('/incoming-call', async (c) => {
 	});
 });
 
-app.all('/media-stream', (c) => {
+app.all('/:caller/media-stream', (c) => {
 	const upgradeHeader = c.req.header('Upgrade');
 	if (!upgradeHeader || upgradeHeader !== 'websocket') {
 		return c.text('Durable Object expected Upgrade: websocket', {
@@ -79,51 +87,50 @@ app.all('/media-stream', (c) => {
 		});
 	}
 
+	const caller = c.req.param('caller');
+
 	const url = new URL(c.req.url);
 
 	console.log('URL ==> ', url.toString());
-	// if (!caller) {
-	// 	return c.text('Missing Caller parameter', {
-	// 		status: 400,
-	// 	});
-	// }
-	// let id = c.env.WEBSOCKET_SERVER.idFromName(caller);
-	let id = c.env.DO.idFromName('+14803718070');
-	let stub = c.env.DO.get(id);
+	console.log('CALLER =>', caller);
+	if (!caller) {
+		return c.text('Missing Caller parameter', {
+			status: 400,
+		});
+	}
 
-	return stub.fetch(c.req.raw);
+	let id = c.env.DO.idFromName(caller as string);
+	let stub = c.env.DO.get(id);
+	const modifiedRequest = new Request(c.req.raw);
+	const modifiedUrl = new URL(modifiedRequest.url);
+	modifiedUrl.searchParams.append('Caller', caller);
+	const newRequest = new Request(modifiedUrl, modifiedRequest);
+	return stub.fetch(newRequest);
 });
 
 export class CALL_SESSION extends DurableObject {
 	private _OPENAI_API_KEY: string;
 	private _RESEND_KEY: string;
+	private _SIGNALWIRE_KEY: string;
 	sql: SqlStorage;
 	currentlyConnectedWebSockets: number;
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.sql = ctx.storage.sql;
-		this._OPENAI_API_KEY = env.OPENAI_APIKEY;
-		this._RESEND_KEY = env.RESEND_KEY;
+		this._OPENAI_API_KEY = env.OPEN_AI_APIKEY;
+		this._RESEND_KEY = env.RESEND_APIKEY;
+		this._SIGNALWIRE_KEY = env.SIGNALWIRE_APIKEY;
 		this.currentlyConnectedWebSockets = 0;
-
-		// Create the conversations table if it doesn't exist
-		this.sql.exec(`
-			CREATE TABLE IF NOT EXISTS conversations (
-				id TEXT PRIMARY KEY,
-				object TEXT,
-				type TEXT,
-				status TEXT,
-				role TEXT,
-				content JSON,
-				timestamp INTEGER
-			);
-		`);
 	}
 
 	async fetch(request: Request): Promise<Response> {
 		const webSocketPair = new WebSocketPair();
 		const [client, server] = Object.values(webSocketPair);
 
+		const url = new URL(request.url);
+		const caller = url.searchParams.get('Caller');
+
+		console.log('FETCH CALLER =>', caller);
 		server.accept();
 		this.currentlyConnectedWebSockets += 1;
 
@@ -152,12 +159,16 @@ export class CALL_SESSION extends DurableObject {
 		openAiWs.accept();
 
 		let streamSid: string | null = null;
+		let latestMediaTimestamp = 0;
+		let lastAssistantItem: string | null = null;
+		let markQueue = [];
+		let responseStartTimestampTwilio: number | null = null;
 
 		const sendSessionUpdate = () => {
 			const sessionUpdate = {
 				type: 'session.update',
 				session: {
-					turn_detection: { type: 'server_vad' },
+					turn_detection: { type: 'server_vad', silence_duration_ms: 800, threshold: 0.6 },
 					input_audio_format: 'g711_ulaw',
 					output_audio_format: 'g711_ulaw',
 					voice: VOICE,
@@ -175,7 +186,7 @@ export class CALL_SESSION extends DurableObject {
 
 			console.log('Sending session update:', JSON.stringify(sessionUpdate));
 			openAiWs.send(JSON.stringify(sessionUpdate));
-			this.addPreviousMessages(openAiWs);
+			//this.addPreviousMessages(openAiWs);
 		};
 
 		const responseCreate = (instructions: string) => {
@@ -188,6 +199,68 @@ export class CALL_SESSION extends DurableObject {
 
 			console.log('Generating Welcome Response:', JSON.stringify(response));
 			openAiWs.send(JSON.stringify(response));
+		};
+
+		// Handle interruption when the caller's speech starts
+		const handleSpeechStartedEvent = () => {
+			if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
+				const elapsedTime = latestMediaTimestamp - responseStartTimestampTwilio;
+
+				if (lastAssistantItem) {
+					const truncateEvent = {
+						type: 'conversation.item.truncate',
+						item_id: lastAssistantItem,
+						content_index: 0,
+						audio_end_ms: elapsedTime,
+					};
+					openAiWs.send(JSON.stringify(truncateEvent));
+				}
+
+				server.send(
+					JSON.stringify({
+						event: 'clear',
+						streamSid: streamSid,
+					})
+				);
+
+				// Reset
+				markQueue = [];
+				lastAssistantItem = null;
+				responseStartTimestampTwilio = null;
+			}
+		};
+
+		const sendMark = (connection, streamSid) => {
+			if (streamSid) {
+				const markEvent = {
+					event: 'mark',
+					streamSid: streamSid,
+					mark: { name: 'responsePart' },
+				};
+				connection.send(JSON.stringify(markEvent));
+				markQueue.push('responsePart');
+			}
+		};
+
+		const sendSMS = async ({ message }: any) => {
+			console.log('sending SMS');
+			const url = `https://devize.signalwire.com/api/laml/2010-04-01/Accounts/d8254a51-fda5-420f-9400-fb7860e43846/Messages.json`;
+
+			const formData = new URLSearchParams();
+			formData.append('From', '+13503338493');
+			formData.append('To', caller as string);
+			formData.append('Body', message);
+
+			const response = await fetch(url, {
+				method: 'POST',
+				headers: {
+					Authorization: `Basic ${this._SIGNALWIRE_KEY}`,
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: formData.toString(),
+			});
+
+			console.log(await response.text());
 		};
 
 		openAiWs.addEventListener('open', (event) => {
@@ -206,7 +279,7 @@ export class CALL_SESSION extends DurableObject {
 				if (response.type === 'session.created') {
 					sendSessionUpdate();
 					responseCreate(
-						`If the first Message: Answer the call by saying "Hi, this Jamie with Express One Mortgage, can I answer any mortgage questions for you?" otherwise, continue the conversation`
+						`If the first Message: Answer the call by saying "Hello, this Jamie with Express One Mortgage. How can I help you today?"`
 					);
 				}
 
@@ -215,7 +288,11 @@ export class CALL_SESSION extends DurableObject {
 				}
 
 				if (response.type === 'conversation.item.created') {
-					this.storeConversation(response.item);
+					//this.storeConversation(response.item);
+				}
+
+				if (response.type === 'input_audio_buffer.speech_started') {
+					handleSpeechStartedEvent();
 				}
 
 				if (response.type === 'response.audio.delta' && response.delta) {
@@ -230,10 +307,16 @@ export class CALL_SESSION extends DurableObject {
 					};
 
 					server.send(JSON.stringify(audioDelta));
+					if (!responseStartTimestampTwilio) {
+						responseStartTimestampTwilio = latestMediaTimestamp;
+					}
+					if (response.item_id) {
+						lastAssistantItem = response.item_id;
+					}
+					sendMark(server, streamSid);
 				}
 
 				if (response.type === 'response.function_call_arguments.done') {
-					console.log('Calling ===> ', response);
 					const args = JSON.parse(response.arguments);
 
 					let event: any = null;
@@ -258,14 +341,8 @@ export class CALL_SESSION extends DurableObject {
 							break;
 						}
 						case 'Send_Follow_Up_SMS': {
-							const resend = new Resend(this._RESEND_KEY);
-							const { email, subject, content } = args;
-							await resend.emails.send({
-								to: [email],
-								subject,
-								from: 'expressone@devize.com',
-								text: content || 'Sample mortgage email content',
-							});
+							const { message } = args;
+							await sendSMS({ message });
 							event = {
 								type: 'conversation.item.create',
 								item: {
@@ -288,6 +365,11 @@ export class CALL_SESSION extends DurableObject {
 									}), // result of the function
 								},
 							};
+							break;
+						}
+						case 'end_call': {
+							// Send hangup TwiML to Twilio
+
 							break;
 						}
 						default: {
@@ -335,6 +417,11 @@ export class CALL_SESSION extends DurableObject {
 						console.log('START', data);
 						streamSid = data.start.streamSid;
 						console.log('Incoming stream has started', streamSid);
+						break;
+					case 'mark':
+						if (markQueue.length > 0) {
+							markQueue.shift();
+						}
 						break;
 					default:
 						console.log('Received non-media event:', data.event);
