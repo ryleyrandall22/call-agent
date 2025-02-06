@@ -36,6 +36,12 @@ const tools = [
 	}),
 ];
 
+interface Message {
+	id: string;
+	timestamp: Date;
+	role: 'user' | 'assistant';
+	content: string;
+}
 // Constants
 const SYSTEM_MESSAGE = `Your name is Jamie. You are an customer advocate who works for ExpressOne Mortgage. DO NOT REVEAL YOU ARE AN AI ASSISTANT UNLESS THE USER SPECIFCIALLY ASKS IF YOU ARE. Answer the users questions about Reverse Mortgages while trying to collect their personal info. Be as human as you can, use filler words like "um" and "Yeah one moment". Be casual but professional.
 The way you process audio is quite perfect, so if the user says something that seems to weird not fit the conversation, ask the user to clarify before continuing
@@ -60,17 +66,14 @@ app.get('/', (c) => c.json({ message: 'Twilio Media Stream Server is running!' }
 // Route for Twilio to handle incoming and outgoing calls
 app.all('/incoming-call', async (c) => {
 	const body = await c.req.parseBody();
+	console.log(body);
 	// Create URL parameters for the WebSocket connection
 	console.log(`Caller:$${body.Caller}`);
-	const params = new URLSearchParams();
-
-	params.append('Caller', body.Caller as string);
+	const caller = body.Caller || body.From;
 	const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
                             <Response>
                                 <Connect>
-                                    <Stream url="wss://${c.req.header('host')}/${encodeURIComponent(
-		body.Caller as string
-	)}/media-stream?${params.toString()}" />
+                                    <Stream url="wss://${c.req.header('host')}/${encodeURIComponent(caller as string)}/media-stream" />
                                 </Connect>
                             </Response>`;
 
@@ -112,15 +115,14 @@ export class CALL_SESSION extends DurableObject {
 	private _OPENAI_API_KEY: string;
 	private _RESEND_KEY: string;
 	private _SIGNALWIRE_KEY: string;
-	sql: SqlStorage;
 	currentlyConnectedWebSockets: number;
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
-		this.sql = ctx.storage.sql;
 		this._OPENAI_API_KEY = env.OPEN_AI_APIKEY;
 		this._RESEND_KEY = env.RESEND_APIKEY;
 		this._SIGNALWIRE_KEY = env.SIGNALWIRE_APIKEY;
 		this.currentlyConnectedWebSockets = 0;
+		//ctx.storage.delete('messages');
 	}
 
 	async fetch(request: Request): Promise<Response> {
@@ -162,9 +164,33 @@ export class CALL_SESSION extends DurableObject {
 		let latestMediaTimestamp = 0;
 		let lastAssistantItem: string | null = null;
 		let markQueue = [];
+		let messages: Message[] = [];
 		let responseStartTimestampTwilio: number | null = null;
 
-		const sendSessionUpdate = () => {
+		const sendSessionUpdate = async () => {
+			const prevmessages: Message[] = (await this.ctx.storage.get('messages')) || [];
+			messages = prevmessages;
+			for (const message of messages) {
+				const content =
+					message.role === 'assistant'
+						? [{ type: 'text', text: message.content }]
+						: [
+								{
+									type: 'input_text',
+									text: message.content,
+								},
+						  ];
+				const addMessage = {
+					type: 'conversation.item.create',
+					item: {
+						id: message.id,
+						type: 'message',
+						role: message.role,
+						content: content,
+					},
+				};
+				openAiWs.send(JSON.stringify(addMessage));
+			}
 			const sessionUpdate = {
 				type: 'session.update',
 				session: {
@@ -172,6 +198,9 @@ export class CALL_SESSION extends DurableObject {
 					input_audio_format: 'g711_ulaw',
 					output_audio_format: 'g711_ulaw',
 					voice: VOICE,
+					input_audio_transcription: {
+						model: 'whisper-1',
+					},
 					tools: tools.map((tool) => ({
 						type: tool.type,
 						name: tool.function.name,
@@ -179,20 +208,20 @@ export class CALL_SESSION extends DurableObject {
 						description: tool.function.description,
 					})),
 					instructions: SYSTEM_MESSAGE,
-					modalities: ['text', 'audio'],
+					modalities: ['audio', 'text'],
 					temperature: 0.8,
 				},
 			};
 
-			console.log('Sending session update:', JSON.stringify(sessionUpdate));
 			openAiWs.send(JSON.stringify(sessionUpdate));
-			//this.addPreviousMessages(openAiWs);
 		};
 
 		const responseCreate = (instructions: string) => {
+			console.log('Message in Stack', messages);
 			const response = {
 				type: 'response.create',
 				response: {
+					modalities: ['audio', 'text'],
 					instructions: instructions,
 				},
 			};
@@ -246,6 +275,7 @@ export class CALL_SESSION extends DurableObject {
 			console.log('sending SMS');
 			const url = `https://devize.signalwire.com/api/laml/2010-04-01/Accounts/d8254a51-fda5-420f-9400-fb7860e43846/Messages.json`;
 
+			console.log('CALLER => ', caller);
 			const formData = new URLSearchParams();
 			formData.append('From', '+13503338493');
 			formData.append('To', caller as string);
@@ -264,7 +294,6 @@ export class CALL_SESSION extends DurableObject {
 		};
 
 		openAiWs.addEventListener('open', (event) => {
-			console.log(event);
 			console.log('Connected to the OpenAI Realtime API');
 		});
 
@@ -273,22 +302,72 @@ export class CALL_SESSION extends DurableObject {
 				const response = JSON.parse(event.data.toString());
 
 				if (LOG_EVENT_TYPES.includes(response.type)) {
-					console.log(`Received event: ${response.type}`, response);
+					//console.log(`Received event: ${response.type}`, response);
 				}
 
+				if (response.type === 'error') {
+					console.log(response);
+				}
 				if (response.type === 'session.created') {
-					sendSessionUpdate();
+					await sendSessionUpdate();
 					responseCreate(
-						`If the first Message: Answer the call by saying "Hello, this Jamie with Express One Mortgage. How can I help you today?"`
+						`If you haven't spoken to this user before, answer the call by saying "Hello this is Jamie with Express One Mortgage". If you have spoken with this call, say answer the like a nice and normal person`
 					);
 				}
 
 				if (response.type === 'session.updated') {
-					console.log('Session updated successfully:', response);
+					//	console.log('Session updated successfully:', response);
 				}
 
+				//Looking at conversation items created
 				if (response.type === 'conversation.item.created') {
-					//this.storeConversation(response.item);
+					const previousItemId = response.previous_item_id;
+					const convoItem = response.item;
+					if (convoItem.type === 'message') {
+						const messageExists = messages.some((msg) => msg.id === convoItem.id);
+
+						if (!messageExists) {
+							messages.push({
+								id: convoItem.id,
+								role: convoItem.role,
+								content: '',
+								timestamp: new Date(),
+							});
+						}
+					}
+				}
+
+				if (response.type === 'response.done') {
+					console.log('DONE RESPONSE');
+					//console.log(JSON.stringify(response.response.output, null, 4));
+				}
+
+				//Handling transcript
+				if (response.type === 'response.audio_transcript.done') {
+					const message: Message = {
+						role: 'assistant',
+						content: response.transcript,
+						id: response.item_id,
+						timestamp: new Date(),
+					};
+
+					const messageIndex = messages.findIndex((msg) => msg.id === message.id);
+					if (messageIndex !== -1) {
+						messages[messageIndex].content = response.transcript;
+					}
+				}
+				if (response.type === 'conversation.item.input_audio_transcription.completed') {
+					const message: Message = {
+						role: 'user',
+						content: response.transcript,
+						id: response.item_id,
+						timestamp: new Date(),
+					};
+
+					const messageIndex = messages.findIndex((msg) => msg.id === message.id);
+					if (messageIndex !== -1) {
+						messages[messageIndex].content = response.transcript;
+					}
 				}
 
 				if (response.type === 'input_audio_buffer.speech_started') {
@@ -391,7 +470,7 @@ export class CALL_SESSION extends DurableObject {
 		});
 
 		openAiWs.addEventListener('close', () => {
-			console.log('Disconnected from the OpenAI Realtime API');
+			this.ctx.storage.put('messages', messages);
 		});
 
 		openAiWs.addEventListener('error', (error) => {
